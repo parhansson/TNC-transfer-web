@@ -1,0 +1,536 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HEIDENHAIN TNC155A (ME) – Web Serial (Send & PUNCH)</title>
+<style>
+  :root { --gap:12px; --border:#ddd; --muted:#666; --bg:#fafafa; }
+  body { font: 14px/1.45 system-ui, Segoe UI, Roboto, Arial; margin: 20px; }
+  h2 { margin: 0 0 10px 0; }
+  .row { display:flex; gap:var(--gap); flex-wrap: wrap; align-items: center; }
+  .panel { border:1px solid var(--border); border-radius:10px; padding:12px; margin-top:12px; background:#fff; }
+  .muted { color: var(--muted); }
+  button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background:#fff; cursor:pointer; }
+  button[disabled] { opacity:.5; cursor:not-allowed; }
+  input[type=file]{ border:1px dashed var(--border); padding:8px; border-radius:8px; }
+  input[type=number], select, input[type=text] { padding:6px 8px; border:1px solid var(--border); border-radius:8px; }
+  .queue { display:grid; gap:8px; }
+  .item { border:1px solid var(--border); border-radius:8px; padding:8px; display:grid; gap:6px; background:var(--bg); }
+  .bar { height:8px; border-radius:999px; background:#eee; overflow:hidden; }
+  .bar > div { height:100%; width:0%; background:linear-gradient(90deg,#6aa6ff,#72d572); transition: width .15s linear; }
+  .flex { display:flex; align-items:center; gap:8px; }
+  .grow { flex:1; }
+  #log { white-space: pre-wrap; height: 180px; overflow:auto; border-radius:8px; background:var(--bg); }
+  #rxLines { white-space: pre; height: 180px; overflow:auto; border-radius:8px; background:var(--bg); padding:8px; border:1px solid var(--border); }
+  code { background:#f2f2f2; padding:2px 6px; border-radius:6px; }
+</style>
+
+<h2>HEIDENHAIN TNC155A (ME) — Web Serial</h2>
+<p class="muted">
+  1) <b>Connect</b> to your USB-RS232 (null-modem to control).<br/>
+  2) <b>Send</b>: put control in <b>MOD → ME → READ</b> and start the queue.<br/>
+  3) <b>PUNCH</b>: put control in <b>MOD → ME → PUNCH</b> and click <b>Start PUNCH</b>.
+</p>
+
+<div class="panel">
+  <div class="row">
+    <button id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+    <span id="portInfo" class="muted">not connected</span>
+    <span class="muted">| Mode: <b id="mode">idle</b></span>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <div>Baud <input id="baud" type="number" value="2400" min="1200" step="300" style="width:90px"></div>
+    <div>Stop bits
+      <select id="stopBits">
+        <option value="1" selected>1 (7E1)</option>
+        <option value="2">2 (7E2)</option>
+      </select>
+    </div>
+    <div>Block size <input id="blk" type="number" value="256" min="64" step="64" style="width:90px"></div>
+    <label><input id="lineAligned" type="checkbox" checked> line-aligned blocks</label>
+    <button id="btnReopen" disabled>Reconnect with settings</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <input type="file" id="file" multiple />
+    <button id="btnAdd">Add to queue</button>
+    <button id="btnStart" disabled>Start queue</button>
+    <button id="btnAbort" disabled>Stop/Abort</button>
+    <span class="muted" id="sendStatus"></span>
+  </div>
+  <div id="queue" class="queue" style="margin-top:10px"></div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="btnPunch" disabled>Start PUNCH (receive)</button>
+    <input id="rxName" placeholder="received.nc" value="received.nc" />
+    <button id="btnStopPunch" disabled>Stop PUNCH</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div class="grow">
+      <div class="muted">Receive monitor (lines as they arrive)</div>
+      <div id="rxLines"></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="flex"><div class="grow muted">Event log</div><button id="btnClear" class="muted">clear</button></div>
+  <div id="log" class="panel"></div>
+</div>
+
+<script>
+/*** ME protocol constants ***/
+const SOH=0x01, STX=0x02, ETX=0x03, ACK=0x06, NAK=0x15, XON=0x11, XOFF=0x13;
+
+/*** DOM helpers ***/
+const $ = (q)=>document.querySelector(q);
+function log(s){ const d=$("#log"); d.textContent += s + "\n"; d.scrollTop=d.scrollHeight; }
+function setMode(m){ state.mode=m; $("#mode").textContent=m; }
+
+/*** Global state ***/
+const state = {
+  port:null, reader:null, writer:null,
+  paused:false, abort:false, connected:false,
+  rxQueue:[], mode:"idle",
+  baud:9600, stopBits:1, blockSize:256, lineAligned:true,
+};
+
+/*** Utils ***/
+function crlf(text){ return text.replace(/\r?\n/g, "\r\n"); }
+function bccXor(arr){ let b=0; for(let i=0;i<arr.length;i++) b^=arr[i]; return b & 0xFF; }
+function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+function concatBytes(chunks){ let n=0; chunks.forEach(b=>n+=b.length); const out=new Uint8Array(n); let o=0; for(const b of chunks){ out.set(b,o); o+=b.length; } return out; }
+
+/*** Serial I/O ***/
+async function openPort(){
+  state.port = await navigator.serial.requestPort();
+  await state.port.open({ 
+    baudRate: state.baud, 
+    dataBits:7, 
+    parity:"even", 
+    stopBits: state.stopBits,
+    flowControl: "hardware"   // ← enables RTS/CTS if the adapter supports it
+});
+    //TODO Test this
+  //await state.port.setSignals({ dataTerminalReady: true, requestToSend: true });
+  state.reader = state.port.readable.getReader();  // Uint8Array chunks
+  state.writer = state.port.writable.getWriter();
+  state.connected = true;
+  $("#btnDisconnect").disabled = false;
+  $("#btnReopen").disabled = false;
+  $("#btnStart").disabled = false;
+  $("#btnPunch").disabled = false;
+  $("#btnAbort").disabled = false;
+  $("#portInfo").textContent = `connected (${state.baud} 7E${state.stopBits})`;
+  readLoop(); // background
+  log("Port opened.");
+}
+
+async function closePort(){
+  try { state.abort = true; setMode("idle"); } catch{}
+  try { state.reader?.releaseLock(); } catch{}
+  try { state.writer?.releaseLock(); } catch{}
+  try { await state.port?.close(); } catch{}
+  state.port = state.reader = state.writer = null;
+  state.connected = false;
+  $("#btnDisconnect").disabled = true;
+  $("#btnReopen").disabled = true;
+  $("#btnStart").disabled = true;
+  $("#btnPunch").disabled = true;
+  $("#btnAbort").disabled = true;
+  $("#btnStopPunch").disabled = true;
+  $("#portInfo").textContent = "not connected";
+  log("Port closed.");
+}
+
+async function reopenWithSettings(){
+  if (!state.connected) return;
+  await closePort();
+  await openPort();
+}
+
+async function readLoop(){
+  try{
+    while(state.connected){
+      const { value, done } = await state.reader.read();
+      if (done) {
+        log('Port closed by remote.');
+        break
+    };
+    log(value)
+      if (!value) continue;
+      for (const b of value){
+        if (b === XOFF){ state.paused = true; log("< XOFF"); continue; }
+        if (b === XON ){ state.paused = false; log("> XON"); continue; }
+        state.rxQueue.push(b);
+      }
+    }
+  }catch(e){ log("readLoop error: " + e); }
+}
+
+async function writeChunk(buf){ while(state.paused) await delay(10); await state.writer.write(buf); }
+async function writeByte(b){ await writeChunk(new Uint8Array([b])); }
+async function nextByteTimeout(ms){
+  const deadline = Date.now()+ms;
+  while(Date.now()<deadline){
+    if (state.rxQueue.length) return state.rxQueue.shift();
+    await delay(8);
+  }
+  return null;
+}
+async function expectByte(expected, ms){
+  const b = await nextByteTimeout(ms);
+  return b === expected;
+}
+
+/*** ME Handshake (send path) ***/
+async function handshakeSend(){
+  await writeByte(SOH);
+  const ok = await expectByte(ACK, 2000);
+  if (!ok) throw new Error("No ACK on handshake (SOH→ACK). Is control in MOD→ME→READ?");
+}
+
+/*** Line-aligned block packing ***/
+function makeLineAlignedBlocks(u8, maxSize){
+  if (!state.lineAligned) {
+    // simple fixed blocks
+    const blocks=[];
+    for (let off=0; off<u8.length; off+=maxSize) blocks.push(u8.subarray(off, Math.min(off+maxSize,u8.length)));
+    return blocks;
+  }
+  const CR=13, LF=10;
+  const lines=[];
+  let i=0, start=0;
+  while(i<u8.length){
+    if (u8[i]===CR && i+1<u8.length && u8[i+1]===LF){ lines.push(u8.subarray(start,i+2)); i+=2; start=i; }
+    else i++;
+  }
+  if (start<u8.length) lines.push(u8.subarray(start)); // tail
+  const blocks=[]; let cur=[], size=0;
+  const flush=()=>{ if (size>0){ blocks.push(concatBytes(cur)); cur=[]; size=0; } };
+  for (const line of lines){
+    if (line.length>maxSize){ // hard split
+      let off=0; while(off<line.length){ const end=Math.min(off+maxSize,line.length); blocks.push(line.subarray(off,end)); off=end; }
+      continue;
+    }
+    if (size+line.length>maxSize) flush();
+    cur.push(line); size+=line.length;
+  }
+  flush();
+  return blocks;
+}
+
+/*** Send one block (with one retry on NAK) ***/
+async function sendBlock(payload){
+  const header = new Uint8Array([STX]);
+  const trailer = new Uint8Array([ETX]);
+  const bcc = new Uint8Array([bccXor(concatBytes([header,payload,trailer]))]);
+
+  await writeChunk(header);
+  if (payload.length) await writeChunk(payload);
+  await writeChunk(trailer);
+  await writeChunk(bcc);
+
+  let b = await nextByteTimeout(5000);
+  if (b === ACK) return true;
+  if (b === NAK){
+    log("NAK → retry");
+    await writeChunk(header);
+    if (payload.length) await writeChunk(payload);
+    await writeChunk(trailer);
+    await writeChunk(bcc);
+    b = await nextByteTimeout(5000);
+    return b === ACK;
+  }
+  log("No ACK (got " + (b===null ? "timeout" : "0x"+b.toString(16)) + ")");
+  return false;
+}
+
+/*** SEND: one file with line-count progress ***/
+async function sendFile(file, progressCb, lineProgressCb){
+  state.abort=false;
+  const text = await file.text();
+  const content = new TextEncoder().encode(crlf(text));
+  await handshakeSend();
+
+  // Line counting
+  const totalLines = (content.join ? 0 : 0); // not used
+  let total = 0, linesTotal = 0;
+  for (let i=0;i<content.length-1;i++) if (content[i]===13 && content[i+1]===10) linesTotal++;
+
+  const blocks = makeLineAlignedBlocks(content, state.blockSize);
+  const totalBytes = blocks.reduce((a,b)=>a+b.length,0);
+  let sentBytes = 0, sentLines = 0;
+
+  // count lines per block once to avoid recounting
+  const linesPerBlock = blocks.map(b=>{
+    let c=0; for (let i=0;i<b.length-1;i++) if (b[i]===13 && b[i+1]===10) c++; return c;
+  });
+
+  for (let idx=0; idx<blocks.length; idx++){
+    if (state.abort) throw new Error("Aborted");
+    const ok = await sendBlock(blocks[idx]);
+    if (!ok) throw new Error("Block failed");
+    sentBytes += blocks[idx].length;
+    sentLines += linesPerBlock[idx];
+    progressCb(Math.round((sentBytes/totalBytes)*100));
+    lineProgressCb(sentLines, linesTotal);
+  }
+
+  // terminal ETX-only block
+  const okFinal = await sendBlock(new Uint8Array(0));
+  if (!okFinal) throw new Error("Final block failed");
+}
+
+/*** PUNCH (receive): live line monitor + stop control 
+ * 
+ * It automatically detects whether your TNC is using:
+ * 1 Framed ME mode (handshake SOH⇄ACK, STX…ETX + BCC + ACK/NAK), or
+ * 2 Plain ASCII PUNCH mode (starts with ETX + zeros + ASCII text, no handshake).
+ * ***/
+async function punchReceive(asName) {
+  state.abort = false;
+  setMode("punch");
+  $("#btnStopPunch").disabled = false;
+  $("#rxLines").textContent = "";
+
+  log("Waiting for data from control… (MOD→ME→PUNCH)");
+  let firstBytes = [];
+
+  // collect first few bytes to decide which protocol
+  while (!state.abort && firstBytes.length < 16) {
+    const b = await nextByteTimeout(2000);
+    if (b === null) continue;
+    firstBytes.push(b);
+    // ETX or SOH will tell us quickly
+    if (b === SOH || b === STX || b === ETX) break;
+  }
+  if (state.abort) { log("PUNCH stopped."); return; }
+
+  // ----- detect mode -----
+  const first = firstBytes.find(b => b !== 0x00);
+  const asciiMode = (first === ETX);     // ETX preamble → plain ASCII
+  const framedMode = (first === SOH || first === STX);
+
+  if (asciiMode) {
+    log("Detected ASCII PUNCH mode (ETX + zeros + plain text)");
+    await captureAsciiPunch(firstBytes, asName);
+  } else if (framedMode) {
+    log("Detected framed ME mode (SOH/STX + BCC + ACK/NAK)");
+    // Push back any bytes we already read so normal reader sees them
+    state.rxQueue.unshift(...firstBytes);
+    await captureFramedPunch(asName);
+  } else {
+    log("Unknown header pattern, assuming ASCII PUNCH");
+    log(`Header ${firstBytes.map(b=>'0x'+b.toString(16)).join(' ')}`);
+    await captureAsciiPunch(firstBytes, asName);
+  }
+
+  $("#btnStopPunch").disabled = true;
+  setMode("idle");
+}
+
+// --- Plain ASCII punch ---
+async function captureAsciiPunch(preamble, asName) {
+  let started = false;
+  const buf = [];
+  $("#rxLines").textContent = "";
+
+  // feed preamble through once
+  for (const b of preamble) {
+    if (b === ETX && !started) { started = true; continue; }
+  }
+
+  while (!state.abort) {
+    const b = await nextByteTimeout(2000);
+    if (b === null) continue;
+
+    if (!started) {
+      if (b === ETX) { started = true; continue; }
+      continue;
+    }
+
+    if (b === 0x00) continue;     // ignore padding
+    if (b === ETX) { log("End of ASCII PUNCH (ETX)"); break; }
+
+    buf.push(b);
+    if (b === 10) { // LF → flush line
+      const line = new TextDecoder().decode(new Uint8Array(buf));
+      $("#rxLines").textContent += line;
+      $("#rxLines").scrollTop = $("#rxLines").scrollHeight;
+      buf.length = 0;
+    }
+  }
+
+  if (buf.length)
+    $("#rxLines").textContent += new TextDecoder().decode(new Uint8Array(buf));
+
+  savePunchFile($("#rxLines").textContent, asName);
+  log("ASCII PUNCH saved as " + asName);
+}
+
+// --- Framed ME punch (classic) ---
+async function captureFramedPunch(asName) {
+  log("Handshake: waiting SOH");
+  let b=null; while(!state.abort && (b = await nextByteTimeout(10000)) !== SOH) {
+    if (b===null) { log("…still waiting"); continue; }
+  }
+  if (state.abort) return;
+  await writeByte(ACK);
+  log("SOH⇄ACK OK → receiving framed data");
+
+  const chunks = [], lineBuf=[];
+  while(!state.abort) {
+    const gotSTX = await expectByte(STX,15000);
+    if (!gotSTX) { log("Timeout STX"); break; }
+    const payload=[];
+    let byte;
+    while((byte=await nextByteTimeout(5000))!==null){
+      if(byte===ETX) break;
+      payload.push(byte);
+      lineBuf.push(byte);
+      if (lineBuf.length>=2 && lineBuf.at(-2)===13 && lineBuf.at(-1)===10){
+        const txt=new TextDecoder().decode(new Uint8Array(lineBuf));
+        $("#rxLines").textContent+=txt;
+        $("#rxLines").scrollTop=$("#rxLines").scrollHeight;
+        lineBuf.length=0;
+      }
+    }
+    const bcc=await nextByteTimeout(3000);
+    if(bcc===null){ log("Timeout BCC"); break; }
+    const calc=bccXor(concatBytes([new Uint8Array([STX]),new Uint8Array(payload),new Uint8Array([ETX])]));
+    if(bcc!==calc){ log(`BCC mismatch got 0x${bcc.toString(16)} exp 0x${calc.toString(16)}`); await writeByte(NAK); continue; }
+    await writeByte(ACK);
+    if(payload.length===0){ log("End block (empty)"); break; }
+    chunks.push(new Uint8Array(payload));
+  }
+
+  if(lineBuf.length) $("#rxLines").textContent+=new TextDecoder().decode(new Uint8Array(lineBuf));
+  savePunchFile($("#rxLines").textContent, asName);
+  log("Framed PUNCH saved as " + asName);
+}
+
+// --- Common save helper ---
+function savePunchFile(text, name) {
+  const blob = new Blob([text], { type:"text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name || "received.nc";
+  a.click();
+}
+
+/*** Queue UI & processing ***/
+const queue = [];
+function renderQueue(){
+  const host=$("#queue"); host.innerHTML="";
+  queue.forEach((q,i)=>{
+    const div=document.createElement("div");
+    div.className="item";
+    div.innerHTML = `
+      <div class="flex">
+        <strong class="grow">${q.file.name}</strong>
+        <span class="muted">${(q.file.size/1024).toFixed(1)} KB</span>
+        <span>${q.status}</span>
+      </div>
+      <div class="bar"><div style="width:${q.progress}%"></div></div>
+      <div class="muted">Lines: ${q.sentLines}/${q.totalLines}</div>
+    `;
+    host.appendChild(div);
+  });
+}
+
+function addFiles(files){
+  for (const f of files){
+    queue.push({ file:f, progress:0, status:"queued", sentLines:0, totalLines:0 });
+  }
+  renderQueue();
+}
+
+async function runQueue(){
+  if (!state.connected) { alert("Connect first."); return; }
+  if (state.mode==="punch") { alert("Stop PUNCH first."); return; }
+  setMode("sending");
+  $("#sendStatus").textContent = "sending…";
+  for (let i=0;i<queue.length;i++){
+    const it = queue[i];
+    if (it.status==="done") continue;
+    it.status="sending"; it.progress=0; it.sentLines=0;
+
+    // pre-count total lines
+    const text = await it.file.text();
+    it.totalLines = (crlf(text).match(/\r\n/g)||[]).length;
+
+    renderQueue();
+    try {
+      await sendFile(
+        it.file,
+        p => { it.progress=p; renderQueue(); },
+        (sentLines,totalLines)=>{ it.sentLines=sentLines; it.totalLines=totalLines; renderQueue(); }
+      );
+      it.status="done"; it.progress=100; renderQueue();
+    } catch(e){
+      it.status = "error: " + (e.message||e); renderQueue();
+      log("ERROR sending "+it.file.name+": "+(e.message||e));
+      break;
+    }
+    if (state.abort) break;
+  }
+  $("#sendStatus").textContent="";
+  setMode("idle");
+}
+
+/*** Wire up UI ***/
+$("#btnConnect").onclick = async ()=>{
+  if (!('serial' in navigator)) { alert("Web Serial not supported."); return; }
+  // read settings
+  state.baud = parseInt($("#baud").value,10)||9600;
+  state.stopBits = parseInt($("#stopBits").value,10)||1;
+  state.blockSize = parseInt($("#blk").value,10)||256;
+  state.lineAligned = $("#lineAligned").checked;
+  try { await openPort(); } catch(e){ log("Connect error: " + e); }
+};
+$("#btnDisconnect").onclick = ()=> closePort();
+$("#btnReopen").onclick = async ()=>{
+  state.baud = parseInt($("#baud").value,10)||9600;
+  state.stopBits = parseInt($("#stopBits").value,10)||1;
+  state.blockSize = parseInt($("#blk").value,10)||256;
+  state.lineAligned = $("#lineAligned").checked;
+  try { await reopenWithSettings(); } catch(e){ log("Reopen error: "+e); }
+};
+
+$("#btnAdd").onclick = ()=>{
+  const fi=$("#file");
+  if (fi.files && fi.files.length) { addFiles(fi.files); fi.value=""; }
+};
+$("#btnStart").onclick = ()=> runQueue();
+$("#btnAbort").onclick = ()=>{
+  state.abort = true;
+  if (state.mode==="punch") $("#btnStopPunch").disabled = true;
+  setMode("idle");
+  log("Abort requested.");
+};
+$("#btnPunch").onclick = async ()=>{
+  if (!state.connected){ alert("Connect first."); return; }
+  if (state.mode==="sending"){ alert("Stop sending first."); return; }
+  try {
+    await punchReceive($("#rxName").value || "received.nc");
+  } catch(e){ log("PUNCH error: " + (e.message||e)); }
+};
+$("#btnStopPunch").onclick = ()=>{
+  state.abort = true;
+  setMode("idle");
+  $("#btnStopPunch").disabled = true;
+  log("Stop PUNCH requested.");
+};
+$("#btnClear").onclick = ()=> { $("#log").textContent=""; };
+
+/*** Tips ***/
+// – Typical ME serial: 9600 baud, 7 data bits, EVEN parity, 1 stop (try 2 if your TNC is set to 7E2).
+// – Keep block size at 256 for stability; increase only if transfers are rock solid.
+// – Always use a proper null-modem cable between USB-RS232 and the control.
+</script>
